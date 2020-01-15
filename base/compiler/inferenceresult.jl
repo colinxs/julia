@@ -2,19 +2,6 @@
 
 const EMPTY_VECTOR = Vector{Any}()
 
-mutable struct InferenceResult
-    interpreter::AbstractInterpreter
-    linfo::MethodInstance
-    argtypes::Vector{Any}
-    overridden_by_const::BitVector
-    result # ::Type, or InferenceState if WIP
-    src #::Union{CodeInfo, OptimizationState, Nothing} # if inferred copy is available
-    function InferenceResult(interp::AbstractInterpreter, linfo::MethodInstance, given_argtypes = nothing)
-        argtypes, overridden_by_const = matching_cache_argtypes(linfo, given_argtypes)
-        return new(interp, linfo, argtypes, overridden_by_const, Any, nothing)
-    end
-end
-
 function is_argtype_match(@nospecialize(given_argtype),
                           @nospecialize(cache_argtype),
                           overridden_by_const::Bool)

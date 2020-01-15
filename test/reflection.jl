@@ -531,7 +531,7 @@ let
     code_typed(f18888, Tuple{}; optimize=false)
     @test m.specializations isa Core.TypeMapEntry  # uncached, but creates the specializations entry
     mi = Core.Compiler.specialize_method(m, Tuple{ft}, Core.svec())
-    interp = Core.Compiler.NativeInterpreter()
+    interp = Core.Compiler.NativeInterpreter(world)
     @test Core.Compiler.inf_for_methodinstance(interp, mi, world) === nothing
     @test !isdefined(mi, :cache)
 

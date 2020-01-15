@@ -1157,7 +1157,7 @@ function invoke_tfunc(interp::AbstractInterpreter, @nospecialize(ft), @nospecial
     isdispatchelem(ft) || return Any # check that we might not have a subtype of `ft` at runtime, before doing supertype lookup below
     types = rewrap_unionall(Tuple{ft, unwrap_unionall(types).parameters...}, types)
     argtype = Tuple{ft, argtype.parameters...}
-    entry = ccall(:jl_gf_invoke_lookup, Any, (Any, UInt), types, sv.params.world)
+    entry = ccall(:jl_gf_invoke_lookup, Any, (Any, UInt), types, interp.world)
     if entry === nothing
         return Any
     end
@@ -1302,7 +1302,7 @@ function builtin_nothrow(@nospecialize(f), argtypes::Array{Any, 1}, @nospecializ
 end
 
 function builtin_tfunction(interp::AbstractInterpreter, @nospecialize(f), argtypes::Array{Any,1},
-                           sv::Union{InferenceState,Nothing}, params::Params = sv.params)
+                           sv::Union{InferenceState,Nothing})
     isva = !isempty(argtypes) && isvarargtype(argtypes[end])
     if f === tuple
         return tuple_tfunc(argtypes)

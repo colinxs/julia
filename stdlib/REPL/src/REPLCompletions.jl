@@ -379,9 +379,8 @@ function get_type_call(expr::Expr)
     length(mt) == 1 || return (Any, false)
     m = first(mt)
     # Typeinference
-    params = Core.Compiler.Params(world)
     interp = Core.Compiler.NativeInterpreter()
-    return_type = Core.Compiler.typeinf_type(interp, m[3], m[1], m[2], params)
+    return_type = Core.Compiler.typeinf_type(interp, m[3], m[1], m[2])
     return_type === nothing && return (Any, false)
     return (return_type, true)
 end

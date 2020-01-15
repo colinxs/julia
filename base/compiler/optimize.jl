@@ -10,9 +10,9 @@ mutable struct OptimizationState
     src::CodeInfo
     mod::Module
     nargs::Int
+    world::UInt
     min_valid::UInt
     max_valid::UInt
-    params::Params
     sptypes::Vector{Any} # static parameters
     slottypes::Vector{Any}
     const_api::Bool
@@ -26,11 +26,10 @@ mutable struct OptimizationState
         return new(frame.linfo,
                    s_edges::Vector{Any},
                    src, frame.mod, frame.nargs,
-                   frame.min_valid, frame.max_valid,
-                   frame.params, frame.sptypes, frame.slottypes, false)
+                   frame.world, frame.min_valid, frame.max_valid,
+                   frame.sptypes, frame.slottypes, false)
     end
-    function OptimizationState(linfo::MethodInstance, src::CodeInfo,
-                               params::Params)
+    function OptimizationState(linfo::MethodInstance, src::CodeInfo)
         # prepare src for running optimization passes
         # if it isn't already
         nssavalues = src.ssavaluetypes
@@ -56,15 +55,15 @@ mutable struct OptimizationState
         return new(linfo,
                    s_edges::Vector{Any},
                    src, inmodule, nargs,
-                   UInt(1), get_world_counter(),
-                   params, sptypes_from_meth_instance(linfo), slottypes, false)
+                   get_world_counter(), UInt(1), get_world_counter(),
+                   sptypes_from_meth_instance(linfo), slottypes, false)
         end
 end
 
-function OptimizationState(linfo::MethodInstance, params::Params)
+function OptimizationState(linfo::MethodInstance)
     src = retrieve_code_info(linfo)
     src === nothing && return nothing
-    return OptimizationState(linfo, src, params)
+    return OptimizationState(linfo, src)
 end
 
 
@@ -104,7 +103,7 @@ _topmod(sv::OptimizationState) = _topmod(sv.mod)
 function update_valid_age!(min_valid::UInt, max_valid::UInt, sv::OptimizationState)
     sv.min_valid = max(sv.min_valid, min_valid)
     sv.max_valid = min(sv.max_valid, max_valid)
-    @assert(sv.min_valid <= sv.params.world <= sv.max_valid,
+    @assert(sv.min_valid <= sv.world <= sv.max_valid,
             "invalid age range update")
     nothing
 end
@@ -122,10 +121,10 @@ function add_backedge!(li::CodeInstance, caller::OptimizationState)
     nothing
 end
 
-function isinlineable(m::Method, me::OptimizationState, bonus::Int=0)
+function isinlineable(m::Method, me::OptimizationState, params::OptimizationParams, bonus::Int=0)
     # compute the cost (size) of inlining this code
     inlineable = false
-    cost_threshold = me.params.inline_cost_threshold
+    cost_threshold = params.inline_cost_threshold
     if m.module === _topmod(m.module)
         # a few functions get special treatment
         name = m.name
@@ -140,7 +139,7 @@ function isinlineable(m::Method, me::OptimizationState, bonus::Int=0)
         end
     end
     if !inlineable
-        inlineable = inline_worthy(me.src.code, me.src, me.sptypes, me.slottypes, me.params, cost_threshold + bonus)
+        inlineable = inline_worthy(me.src.code, me.src, me.sptypes, me.slottypes, params, cost_threshold + bonus)
     end
     return inlineable
 end
@@ -163,7 +162,7 @@ function stmt_affects_purity(@nospecialize(stmt), ir)
 end
 
 # run the optimization work
-function optimize(opt::OptimizationState, @nospecialize(result))
+function optimize(opt::OptimizationState, params::OptimizationParams, @nospecialize(result))
     def = opt.linfo.def
     nargs = Int(opt.nargs) - 1
     @timeit "optimizer" ir = run_passes(opt.src, nargs, opt)
@@ -242,11 +241,11 @@ function optimize(opt::OptimizationState, @nospecialize(result))
         else
             bonus = 0
             if result ⊑ Tuple && !isbitstype(widenconst(result))
-                bonus = opt.params.inline_tupleret_bonus
+                bonus = params.inline_tupleret_bonus
             end
             if opt.src.inlineable
                 # For functions declared @inline, increase the cost threshold 20x
-                bonus += opt.params.inline_cost_threshold*19
+                bonus += params.inline_cost_threshold*19
             end
             opt.src.inlineable = isinlineable(def, opt, bonus)
         end
@@ -277,7 +276,7 @@ plus_saturate(x::Int, y::Int) = max(x, y, x+y)
 # known return type
 isknowntype(@nospecialize T) = (T === Union{}) || isconcretetype(T)
 
-function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any}, slottypes::Vector{Any}, params::Params)
+function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any}, slottypes::Vector{Any}, params::OptimizationParams)
     head = ex.head
     if is_meta_expr_head(head)
         return 0
@@ -367,7 +366,7 @@ function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any}
 end
 
 function inline_worthy(body::Array{Any,1}, src::CodeInfo, sptypes::Vector{Any}, slottypes::Vector{Any},
-                       params::Params, cost_threshold::Integer=params.inline_cost_threshold)
+                       params::OptimizationParams, cost_threshold::Integer=params.inline_cost_threshold)
     bodycost::Int = 0
     for line = 1:length(body)
         stmt = body[line]

@@ -1088,7 +1088,7 @@ function code_typed(@nospecialize(f), @nospecialize(types=Tuple);
                     debuginfo::Symbol=:default,
                     world = get_world_counter(),
                     params = Core.Compiler.Params(world),
-                    interp = Core.Compiler.NativeInterpreter())
+                    interp = Core.Compiler.NativeInterpreter(world))
     ccall(:jl_is_in_pure_context, Bool, ()) && error("code reflection cannot be used from generated functions")
     if isa(f, Core.Builtin)
         throw(ArgumentError("argument is not a generic function"))
@@ -1125,10 +1125,9 @@ function return_types(interp, @nospecialize(f), @nospecialize(types=Tuple))
     types = to_tuple_type(types)
     rt = []
     world = get_world_counter()
-    params = Core.Compiler.Params(world)
     for x in _methods(f, types, -1, world)
         meth = func_for_method_checked(x[3], types, x[2])
-        ty = Core.Compiler.typeinf_type(interp, meth, x[1], x[2], params)
+        ty = Core.Compiler.typeinf_type(interp, meth, x[1], x[2])
         ty === nothing && error("inference not successful") # inference disabled?
         push!(rt, ty)
     end

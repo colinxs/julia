@@ -574,11 +574,11 @@ function batch_inline!(todo::Vector{Any}, ir::IRCode, linetable::Vector{LineInfo
     return ir
 end
 
-function spec_lambda(@nospecialize(atype), sv::OptimizationState, @nospecialize(invoke_data))
+function spec_lambda(interp::AbstractInterpreter, @nospecialize(atype), sv::OptimizationState, @nospecialize(invoke_data))
     min_valid = UInt[typemin(UInt)]
     max_valid = UInt[typemax(UInt)]
     if invoke_data === nothing
-        mi = ccall(:jl_get_spec_lambda, Any, (Any, UInt, Ptr{UInt}, Ptr{UInt}), atype, sv.params.world, min_valid, max_valid)
+        mi = ccall(:jl_get_spec_lambda, Any, (Any, UInt, Ptr{UInt}, Ptr{UInt}), atype, interp.world, min_valid, max_valid)
     else
         invoke_data = invoke_data::InvokeData
         atype <: invoke_data.types0 || return nothing
@@ -587,7 +587,7 @@ function spec_lambda(@nospecialize(atype), sv::OptimizationState, @nospecialize(
         max_valid[1] = invoke_data.max_valid
     end
     mi !== nothing && add_backedge!(mi::MethodInstance, sv)
-    update_valid_age!(min_valid[1], max_valid[1], sv)
+    update_valid_age!(interp, min_valid[1], max_valid[1], sv)
     return mi
 end
 
@@ -810,7 +810,7 @@ function handle_single_case!(ir::IRCode, stmt::Expr, idx::Int, @nospecialize(cas
     nothing
 end
 
-function is_valid_type_for_apply_rewrite(@nospecialize(typ), params::Params)
+function is_valid_type_for_apply_rewrite(@nospecialize(typ), params::OptimizationParams)
     if isa(typ, Const) && isa(typ.val, SimpleVector)
         length(typ.val) > params.MAX_TUPLE_SPLAT && return false
         for p in typ.val
@@ -880,7 +880,7 @@ function call_sig(ir::IRCode, stmt::Expr)
     Signature(f, ft, atypes)
 end
 
-function inline_apply!(ir::IRCode, idx::Int, sig::Signature, params::Params)
+function inline_apply!(ir::IRCode, idx::Int, sig::Signature, params::OptimizationParams)
     stmt = ir.stmts[idx]
     while sig.f === Core._apply || sig.f === Core._apply_iterate
         arg_start = sig.f === Core._apply ? 2 : 3
@@ -919,7 +919,7 @@ is_builtin(s::Signature) =
     isa(s.f, Builtin) ||
     s.ft ⊑ Builtin
 
-function inline_invoke!(ir::IRCode, idx::Int, sig::Signature, invoke_data::InvokeData, sv::OptimizationState, todo::Vector{Any})
+function inline_invoke!(interp::AbstractInterpreter, ir::IRCode, idx::Int, sig::Signature, invoke_data::InvokeData, sv::OptimizationState, todo::Vector{Any})
     stmt = ir.stmts[idx]
     calltype = ir.types[idx]
     method = invoke_data.entry.func
@@ -929,14 +929,14 @@ function inline_invoke!(ir::IRCode, idx::Int, sig::Signature, invoke_data::Invok
     result = analyze_method!(idx, sig, metharg, methsp, method, stmt, sv, true, invoke_data,
                              calltype)
     handle_single_case!(ir, stmt, idx, result, true, todo, sv)
-    update_valid_age!(invoke_data.min_valid, invoke_data.max_valid, sv)
+    update_valid_age!(interp, invoke_data.min_valid, invoke_data.max_valid, sv)
     return nothing
 end
 
 # Handles all analysis and inlining of intrinsics and builtins. In particular,
 # this method does not access the method table or otherwise process generic
 # functions.
-function process_simple!(ir::IRCode, idx::Int, params::Params)
+function process_simple!(ir::IRCode, idx::Int, params::OptimizationParams, world::UInt)
     stmt = ir.stmts[idx]
     stmt isa Expr || return nothing
     if stmt.head === :splatnew
@@ -967,7 +967,7 @@ function process_simple!(ir::IRCode, idx::Int, params::Params)
     # Handle invoke
     invoke_data = nothing
     if sig.f === Core.invoke && length(sig.atypes) >= 3
-        res = compute_invoke_data(sig.atypes, params)
+        res = compute_invoke_data(sig.atypes, world)
         res === nothing && return nothing
         (sig, invoke_data) = res
     elseif is_builtin(sig)
@@ -992,7 +992,7 @@ function assemble_inline_todo!(ir::IRCode, sv::OptimizationState)
     # todo = (inline_idx, (isva, isinvoke, na), method, spvals, inline_linetable, inline_ir, lie)
     todo = Any[]
     for idx in 1:length(ir.stmts)
-        r = process_simple!(ir, idx, sv.params)
+        r = process_simple!(ir, idx, sv.params, sv.world)
         r === nothing && continue
 
         stmt = ir.stmts[idx]
@@ -1113,7 +1113,7 @@ function linear_inline_eligible(ir::IRCode)
     return true
 end
 
-function compute_invoke_data(@nospecialize(atypes), params::Params)
+function compute_invoke_data(@nospecialize(atypes), world::UInt)
     ft = widenconst(atypes[2])
     if !isdispatchelem(ft) || has_free_typevars(ft) || (ft <: Builtin)
         # TODO: this can be rather aggressive at preventing inlining of closures
@@ -1132,7 +1132,7 @@ function compute_invoke_data(@nospecialize(atypes), params::Params)
     min_valid = UInt[typemin(UInt)]
     max_valid = UInt[typemax(UInt)]
     invoke_entry = ccall(:jl_gf_invoke_lookup, Any, (Any, UInt),
-                         invoke_types, params.world) # XXX: min_valid, max_valid
+                         invoke_types, world) # XXX: min_valid, max_valid
     invoke_entry === nothing && return nothing
     invoke_data = InvokeData(invoke_entry::Core.TypeMapEntry, invoke_types, min_valid[1], max_valid[1])
     atype0 = atypes[2]
@@ -1150,7 +1150,7 @@ function ispuretopfunction(@nospecialize(f))
         istopfunction(f, :promote_type)
 end
 
-function early_inline_special_case(ir::IRCode, s::Signature, e::Expr, params::Params,
+function early_inline_special_case(ir::IRCode, s::Signature, e::Expr, params::OptimizationParams,
                                    @nospecialize(etype))
     f, ft, atypes = s.f, s.ft, s.atypes
     if (f === typeassert || ft ⊑ typeof(typeassert)) && length(atypes) == 3
@@ -1306,7 +1306,7 @@ function find_inferred(mi::MethodInstance, @nospecialize(atypes), sv::Optimizati
         end
     end
 
-    linfo = inf_for_methodinstance(Core.Compiler.NativeInterpreter(), mi, sv.params.world)
+    linfo = inf_for_methodinstance(Core.Compiler.NativeInterpreter(sv.params.world), mi, sv.params.world)
     if linfo isa CodeInstance
         if invoke_api(linfo) == 2
             # in this case function can be inlined to a constant

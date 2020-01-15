@@ -4,6 +4,8 @@
 # constants #
 #############
 
+const DEFAULT_INTERPRETER = NativeInterpreter(UInt(0))
+
 const CoreNumType = Union{Int32, Int64, Float32, Float64}
 
 const _REF_NAME = Ref.body.name
@@ -17,7 +19,7 @@ call_result_unused(frame::InferenceState, pc::LineNum=frame.currpc) =
     isexpr(frame.src.code[frame.currpc], :call) && isempty(frame.ssavalue_uses[pc])
 
 function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f), argtypes::Vector{Any}, @nospecialize(atype), sv::InferenceState,
-                                  max_methods = sv.params.MAX_METHODS)
+                                  max_methods = interp.inf_params.MAX_METHODS)
     atype_params = unwrap_unionall(atype).parameters
     ft = unwrap_unionall(atype_params[1]) # TODO: ccall jl_method_table_for here
     isa(ft, DataType) || return Any # the function being called is unknown. can't properly handle this backedge right now
@@ -37,17 +39,17 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
     end
     min_valid = UInt[typemin(UInt)]
     max_valid = UInt[typemax(UInt)]
-    splitunions = 1 < countunionsplit(atype_params) <= sv.params.MAX_UNION_SPLITTING
+    splitunions = 1 < countunionsplit(atype_params) <= interp.inf_params.MAX_UNION_SPLITTING
     if splitunions
         splitsigs = switchtupleunion(atype)
         applicable = Any[]
         for sig_n in splitsigs
-            xapplicable = _methods_by_ftype(sig_n, max_methods, sv.params.world, min_valid, max_valid)
+            xapplicable = _methods_by_ftype(sig_n, max_methods, interp.world, min_valid, max_valid)
             xapplicable === false && return Any
             append!(applicable, xapplicable)
         end
     else
-        applicable = _methods_by_ftype(atype, max_methods, sv.params.world, min_valid, max_valid)
+        applicable = _methods_by_ftype(atype, max_methods, interp.world, min_valid, max_valid)
         if applicable === false
             # this means too many methods matched
             # (assume this will always be true, so we don't compute / update valid age in this case)
@@ -84,7 +86,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
         sigtuple = unwrap_unionall(sig)::DataType
         splitunions = false
         this_rt = Bottom
-        # TODO: splitunions = 1 < countunionsplit(sigtuple.parameters) * napplicable <= sv.params.MAX_UNION_SPLITTING
+        # TODO: splitunions = 1 < countunionsplit(sigtuple.parameters) * napplicable <= interp.inf_params.MAX_UNION_SPLITTING
         # currently this triggers a bug in inference recursion detection
         if splitunions
             splitsigs = switchtupleunion(sig)
@@ -117,7 +119,7 @@ function abstract_call_gf_by_type(interp::AbstractInterpreter, @nospecialize(f),
     end
     # try constant propagation if only 1 method is inferred to non-Bottom
     # this is in preparation for inlining, or improving the return result
-    if nonbot > 0 && seen == napplicable && !edgecycle && isa(rettype, Type) && sv.params.ipo_constant_propagation
+    if nonbot > 0 && seen == napplicable && !edgecycle && isa(rettype, Type) && interp.inf_params.ipo_constant_propagation
         # if there's a possibility we could constant-propagate a better result
         # (hopefully without doing too much work), try to do that now
         # TODO: it feels like this could be better integrated into abstract_call_method / typeinf_edge
@@ -215,7 +217,7 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter, @nosp
                      istopfunction(f, :<<) || istopfunction(f, :>>))
         return Any
     end
-    force_inference = allconst || sv.params.aggressive_constant_propagation
+    force_inference = allconst || interp.inf_params.aggressive_constant_propagation
     if istopfunction(f, :getproperty) || istopfunction(f, :setproperty!)
         force_inference = true
     end
@@ -226,7 +228,7 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter, @nosp
     mi = mi::MethodInstance
     # decide if it's likely to be worthwhile
     if !force_inference
-        code = inf_for_methodinstance(interp, mi, sv.params.world)
+        code = inf_for_methodinstance(interp, mi, interp.world)
         declared_inline = isdefined(method, :source) && ccall(:jl_ast_flag_inlineable, Bool, (Any,), method.source)
         cache_inlineable = declared_inline
         if isdefined(code, :inferred) && !cache_inlineable
@@ -241,14 +243,14 @@ function abstract_call_method_with_const_args(interp::AbstractInterpreter, @nosp
             return Any
         end
     end
-    inf_result = cache_lookup(mi, argtypes, sv.params.cache)
+    inf_result = cache_lookup(mi, argtypes, interp.cache)
     if inf_result === nothing
-        inf_result = InferenceResult(interp, mi, argtypes)
-        frame = InferenceState(inf_result, #=cache=#false, sv.params)
+        inf_result = InferenceResult(mi, argtypes)
+        frame = InferenceState(inf_result, #=cache=#false, interp)
         frame.limited = true
         frame.parent = sv
-        push!(sv.params.cache, inf_result)
-        typeinf(frame) || return Any
+        push!(interp.cache, inf_result)
+        typeinf(interp, frame) || return Any
     end
     result = inf_result.result
     isa(result, InferenceState) && return Any # TODO: unexpected, is this recursive constant inference?
@@ -356,7 +358,7 @@ function abstract_call_method(interp::AbstractInterpreter, method::Method, @nosp
             comparison = method.sig
         end
         # see if the type is actually too big (relative to the caller), and limit it if required
-        newsig = limit_type_size(sig, comparison, hardlimit ? comparison : sv.linfo.specTypes, sv.params.TUPLE_COMPLEXITY_LIMIT_DEPTH, spec_len)
+        newsig = limit_type_size(sig, comparison, hardlimit ? comparison : sv.linfo.specTypes, interp.inf_params.TUPLE_COMPLEXITY_LIMIT_DEPTH, spec_len)
 
         if newsig !== sig
             # continue inference, but note that we've limited parameter complexity
@@ -393,7 +395,7 @@ function abstract_call_method(interp::AbstractInterpreter, method::Method, @nosp
         #     while !(newsig in seen)
         #         push!(seen, newsig)
         #         lsig = length((unwrap_unionall(sig)::DataType).parameters)
-        #         newsig = limit_type_size(newsig, sig, sv.linfo.specTypes, sv.params.TUPLE_COMPLEXITY_LIMIT_DEPTH, lsig)
+        #         newsig = limit_type_size(newsig, sig, sv.linfo.specTypes, interp.inf_params.TUPLE_COMPLEXITY_LIMIT_DEPTH, lsig)
         #         recomputed = ccall(:jl_type_intersection_with_env, Any, (Any, Any), newsig, method.sig)::SimpleVector
         #         newsig = recomputed[2]
         #     end
@@ -522,7 +524,7 @@ function abstract_iteration(interp, @nospecialize(itft), @nospecialize(itertype)
     valtype = statetype = Bottom
     ret = Any[]
     stateordonet = widenconst(stateordonet)
-    while !(Nothing <: stateordonet) && length(ret) < sv.params.MAX_TUPLE_SPLAT
+    while !(Nothing <: stateordonet) && length(ret) < interp.inf_params.MAX_TUPLE_SPLAT
         if !isa(stateordonet, DataType) || !(stateordonet <: Tuple) || isvatuple(stateordonet) || length(stateordonet.parameters) != 2
             break
         end
@@ -559,7 +561,7 @@ end
 
 # do apply(af, fargs...), where af is a function value
 function abstract_apply(interp::AbstractInterpreter, @nospecialize(itft), @nospecialize(aft), aargtypes::Vector{Any}, vtypes::VarTable, sv::InferenceState,
-                        max_methods = sv.params.MAX_METHODS)
+                        max_methods = interp.inf_params.MAX_METHODS)
     aftw = widenconst(aft)
     if !isa(aft, Const) && (!isType(aftw) || has_free_typevars(aftw))
         if !isconcretetype(aftw) || (aftw <: Builtin)
@@ -571,7 +573,7 @@ function abstract_apply(interp::AbstractInterpreter, @nospecialize(itft), @nospe
     end
     res = Union{}
     nargs = length(aargtypes)
-    splitunions = 1 < countunionsplit(aargtypes) <= sv.params.MAX_APPLY_UNION_ENUM
+    splitunions = 1 < countunionsplit(aargtypes) <= interp.inf_params.MAX_APPLY_UNION_ENUM
     ctypes = Any[Any[aft]]
     for i = 1:nargs
         ctypes´ = []
@@ -658,7 +660,7 @@ function argtype_tail(argtypes::Vector{Any}, i::Int)
 end
 
 # call where the function is known exactly
-function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f), fargs::Union{Nothing,Vector{Any}}, argtypes::Vector{Any}, vtypes::VarTable, sv::InferenceState, max_methods = sv.params.MAX_METHODS)
+function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f), fargs::Union{Nothing,Vector{Any}}, argtypes::Vector{Any}, vtypes::VarTable, sv::InferenceState, max_methods = interp.inf_params.MAX_METHODS)
     la = length(argtypes)
 
     if isa(f, Builtin)
@@ -875,7 +877,7 @@ end
 
 # call where the function is any lattice element
 function abstract_call(interp::AbstractInterpreter, fargs::Union{Nothing,Vector{Any}}, argtypes::Vector{Any},
-                       vtypes::VarTable, sv::InferenceState, max_methods = sv.params.MAX_METHODS)
+                       vtypes::VarTable, sv::InferenceState, max_methods = interp.inf_params.MAX_METHODS)
     #print("call ", e.args[1], argtypes, "\n\n")
     ft = argtypes[1]
     if isa(ft, Const)
@@ -965,7 +967,7 @@ function abstract_eval(interp::AbstractInterpreter, @nospecialize(e), vtypes::Va
         n = length(ea)
         argtypes = Vector{Any}(undef, n)
         @inbounds for i = 1:n
-            ai = abstract_eval(ea[i], vtypes, sv)
+            ai = abstract_eval(interp, ea[i], vtypes, sv)
             if ai === Bottom
                 return Bottom
             end
@@ -1098,7 +1100,7 @@ function abstract_eval_ssavalue(s::SSAValue, src::CodeInfo)
 end
 
 # make as much progress on `frame` as possible (without handling cycles)
-function typeinf_local(frame::InferenceState)
+function typeinf_local(interp::AbstractInterpreter, frame::InferenceState)
     @assert !frame.inferred
     frame.dont_work_on_me = true # mark that this function is currently on the stack
     W = frame.ip
@@ -1131,7 +1133,7 @@ function typeinf_local(frame::InferenceState)
             elseif isa(stmt, GotoNode)
                 pc´ = (stmt::GotoNode).label
             elseif hd === :gotoifnot
-                condt = abstract_eval(frame.result.interpreter, stmt.args[1], s[pc], frame)
+                condt = abstract_eval(interp, stmt.args[1], s[pc], frame)
                 if condt === Bottom
                     break
                 end
@@ -1165,7 +1167,7 @@ function typeinf_local(frame::InferenceState)
                 end
             elseif hd === :return
                 pc´ = n + 1
-                rt = widenconditional(abstract_eval(frame.result.interpreter, stmt.args[1], s[pc], frame))
+                rt = widenconditional(abstract_eval(interp, stmt.args[1], s[pc], frame))
                 if !isa(rt, Const) && !isa(rt, Type) && !isa(rt, PartialStruct)
                     # only propagate information we know we can store
                     # and is valid inter-procedurally
@@ -1210,7 +1212,7 @@ function typeinf_local(frame::InferenceState)
                 end
             else
                 if hd === :(=)
-                    t = abstract_eval(frame.result.interpreter, stmt.args[2], changes, frame)
+                    t = abstract_eval(interp, stmt.args[2], changes, frame)
                     t === Bottom && break
                     frame.src.ssavaluetypes[pc] = t
                     lhs = stmt.args[1]
@@ -1224,7 +1226,7 @@ function typeinf_local(frame::InferenceState)
                     end
                 elseif hd === :inbounds || hd === :meta || hd === :loopinfo
                 else
-                    t = abstract_eval(frame.result.interpreter, stmt, changes, frame)
+                    t = abstract_eval(interp, stmt, changes, frame)
                     t === Bottom && break
                     if !isempty(frame.ssavalue_uses[pc])
                         record_ssa_assign(pc, t, frame)
@@ -1279,8 +1281,8 @@ function typeinf_local(frame::InferenceState)
 end
 
 # make as much progress on `frame` as possible (by handling cycles)
-function typeinf_nocycle(frame::InferenceState)
-    typeinf_local(frame)
+function typeinf_nocycle(interp::AbstractInterpreter, frame::InferenceState)
+    typeinf_local(interp, frame)
 
     # If the current frame is part of a cycle, solve the cycle before finishing
     no_active_ips_in_callers = false
@@ -1292,7 +1294,7 @@ function typeinf_nocycle(frame::InferenceState)
                 # Note that `typeinf_local(interp, caller)` can potentially modify the other frames
                 # `frame.callers_in_cycle`, which is why making incremental progress requires the
                 # outer while loop.
-                typeinf_local(caller)
+                typeinf_local(interp, caller)
                 no_active_ips_in_callers = false
             end
             if caller.min_valid < frame.min_valid
